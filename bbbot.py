@@ -30,11 +30,13 @@ if gpus:
     print(e)
 
 DISCOUNT = 0.99
-REPLAY_MEMORY_SIZE = 64 #Max sample memory.
-MIN_REPLAY_MEMORY_SIZE = 16 #Minimum for training.
+REPLAY_MEMORY_SIZE = 128 #Max sample memory.
+MIN_REPLAY_MEMORY_SIZE = 72
+MINIBATCH_SIZE = 32
 UPDATE_TARGET_EVERY = 1
 MIN_REWARD = -30  # For model save
 #MEMORY_FRACTION = 0.20
+timesteps = [1,2,4,8,16,32] #number of timesteps to be future predicted.
 
 # Environment settings
 EPISODES = 1_600
@@ -58,10 +60,8 @@ class Environment():
     OBSERVATION_SPACE_VALUES = (80, 80, 3)
     RETURN_IMAGES = True
     #REWARD_SPACE_SIZE = 3
-    FANSTASTIC = 10
-    GREAT = 5
     GOOD = 1
-    BAD = 20
+    BAD = 10
 
     def startGame(self):
         #start the game, giving the user a few seconds to click on the chrome tab after starting the code
@@ -158,15 +158,18 @@ class Environment():
 
         self.episode_step += 1
 
-        #this is the initial image collected when doing first step.
+        if self.RETURN_IMAGES:
+            img = np.array(self.eyes())
+
+        state = np.array(img)
+
         screen2 = np.array(ImageGrab.grab(bbox=(650, 340, 800, 365)))
         grey2 = cv2.cvtColor(screen2, cv2.COLOR_BGR2GRAY)
         score1 = pytesseract.image_to_string(grey2)
         if score1.endswith('\n'):
             score1[:-2]
 
-        #Do action.
-        push = self.action(action)
+        self.action(action)
 
         if self.RETURN_IMAGES:
             next_img = np.array(self.eyes())
@@ -174,8 +177,7 @@ class Environment():
         new_state = np.array(next_img)
 
         done = False
-        
-        #This is the image taken once action is done.
+
         screen3 = np.array(ImageGrab.grab(bbox=(650, 340, 800, 365)))
         grey3 = cv2.cvtColor(screen3, cv2.COLOR_BGR2GRAY)
         score2 = pytesseract.image_to_string(grey3)
@@ -188,6 +190,18 @@ class Environment():
         if score2 == ('oo\n'):
             score2 = 0
 
+        if score1 == (''):
+            score1 = 0
+
+        if score2 == (''):
+            score2 = 0
+
+        if score1 == str():
+            score1.delete(str())
+
+        if score2 == str():
+            score2.delete(str())
+
         if int(score2) - int(score1) == 10:
             reward = self.GOOD
             print('ok')
@@ -197,26 +211,26 @@ class Environment():
             print('ok')
 
         if int(score2) - int(score1) == 1000:
-            reward = self.GREAT
+            reward = self.GOOD
             print('good')
 
         if int(score2)  - int(score1) == 2000:
-            reward = self.GREAT
+            reward = self.GOOD
             print('great')
 
         if int(score2)  - int(score1) > 1000 < 2_000:
-            reward = self.GREAT
+            reward = self.GOOD
             print('great')
 
         if int(score2)  - int(score1) == 3000:
-            reward = self.Great
+            reward = self.GOOD
             print('great')
 
         if int(score2)  - int(score1) > 3000 < 10_000:
-            reward = self.FANSTASTIC
+            reward = self.GOOD
             print('fantastic')
 
-        #for the words after dying, push start = Done.
+        #for the push start = Done.
         screen3 = np.array(ImageGrab.grab(bbox=(790, 690, 1000, 725)))
         grey3 = cv2.cvtColor(screen3, cv2.COLOR_BGR2GRAY)
         prices2 = pytesseract.image_to_string(grey3)
@@ -230,7 +244,7 @@ class Environment():
 
             reward = self.GOOD
 
-        return new_state, reward, done
+        return state, new_state, reward, done
 
     def eyes(self):
 
@@ -290,14 +304,17 @@ class Deep_stb:
         self.target_model = self.create_model()
         self.target_model.set_weights(self.model.get_weights())
 
-        # An array with last n steps for training
-        self.replay_memory = []
-
         # Custom tensorboard object
         self.tensorboard = ModifiedTensorBoard(log_dir="logs/{}-{}".format(MODEL_NAME, int(time.time())))
 
+        # An array with last n steps for training
+        self.replay_memory = []
+
         # Used to count when to update target network with main network's weights
         self.target_update_counter = 0
+
+        #this allows us to use the timesteps function easier in the agent class.
+        self.timesteps = timesteps
 
     def create_model(self):
 
@@ -377,59 +394,105 @@ class Deep_stb:
         #20 times which for predict makes 200 predictions.
         for i in range(20):
 
+            # Start training only if certain number of samples is already saved
+            if len(self.replay_memory) < MIN_REPLAY_MEMORY_SIZE:
+                return
+
+            #Get rid of the first 64 in replay_mem if exceeds 128
             if len(self.replay_memory) > REPLAY_MEMORY_SIZE:
-                self.replay_memory[:48]
+                self.replay_memory[-64:]
+
+            #take only the last 32 in self.replay_memory
+            future_rep_mem = (self.replay_memory[MINIBATCH_SIZE:])
 
             max_qs = []
 
             min_qs = 2
 
-            #This gives you the current_state/image from env.reset
-            current_states = np.array([transition[0] for transition in self.replay_memory])/255           
+            # Get current states from minibatch, then query NN model for Q values
+            current_states = np.array([transition[0] for transition in self.replay_memory])/255
+
+            # Get future states from minibatch, then query NN model for Q values
+            # When using target network, query it, otherwise main network should be queried
+            new_current_states = np.array([transition[3] for transition in self.replay_memory])/255
+
+            #This allows us to calculate future rewards in the last 32 states of replay_memory
+            for index, (current_state, action, reward, new_current_state, done) in enumerate(future_rep_mem):
+
+                future_rewards = []
+                last_offset = 0
+                done = False
+                #for each item in range 32 + 1
+                for j in range(self.timesteps[-1]+1):
+                    #if not done for each time_step that you're on.
+                    if not (done + j):
+                        if j in self.timesteps: # 1,2,4,8,16,32
+                            #It'll keep calculating future_reward_vals till done.
+                            if not done:
+                                #rewardss over j future_time_steps - current_rewards.
+                                future_rewards += list( (([transition[2] for transition in self.replay_memory] + j) - [transition[2] for transition in self.replay_memory]) )
+                                last_offset = j
+                            else:
+                                #If done at this point future_rewards = reward of last time_step - reward.
+                                future_rewards += list( (([transition[2] for transition in self.replay_memory] + last_offset) - [transition[2] for transition in self.replay_memory]) )
+                    else:
+                        done = True
+
+                current_states = np.array([transition[0] for transition in self.replay_memory])/255
+
+                new_current_states = np.array([transition[3] for transition in self.replay_memory])/255
+
+
             current_qs_list = self.model.predict(current_states)
 
-            #Get 10 sets of q predicts for new_current_state. 
+            #for each item in range ten, predict on future states, and append those predictions to max_qs.
             for i in range(10):
 
-                #This gives you the new_state/img from after reward in step.
-                #the max q value is taken and appended to max_qs.
-                new_current_states = np.array([transition[3] for transition in self.replay_memory])/255
-                future_qs_list = np.max(self.target_model.predict(new_current_states))
+                future_qs_list = self.target_model.predict(new_current_states)
                 max_qs.append(np.array(future_qs_list))
+
+            #for each state in replay_mem rewards = future_rewards.
+            for i in self.replay_memory:
+
+                [transition[2] for transition in self.replay_memory] == future_rewards
+
 
             X = []
             y = []
 
             # Now we need to enumerate our batches
-            #This deals w/ the future states and calculating q_vals.
-
             for index, (current_state, action, reward, new_current_state, done) in enumerate(self.replay_memory):
 
-                #collect the max values of the max_qs, randomely? Idk, max works here but if it does horrah!
-                #collect two so that a mean can be calculated from the q values.
-                select_f_qs = np.max(random.sample(max_qs, min_qs))
+                # If not a terminal state, get new q from future states, otherwise set it to 0
+                # almost like with Q Learning, but we use just part of equation here
+                if not done:
 
-                #the mean/average value of new_q
-                mean_f_qs = select_f_qs.mean()
+                    #the max random sample of 2 qs from the 10 qs we calculated.
+                    select_f_qs = np.max(random.sample(max_qs, min_qs))
 
-                #the variance value of new_q
-                var_f_qs = select_f_qs.var()
+                    #the mean/average value of new_q
+                    mean_f_qs = np.mean(select_f_qs)
 
-                #calculating layer normalization by dividing the square root
-                #of variance of new_q by the new q val subtracted by the mean of new_q.
-                LN_qs = (select_f_qs - mean_f_qs)/(np.sqrt(var_f_qs))
+                    #the variance value of new_q
+                    var_f_qs = np.var(select_f_qs)
 
-                new_q = reward + DISCOUNT * LN_qs
-            else:
-                new_q = reward
+                    #calculating layer normalization by dividing the square root
+                    #of variance of new_q by the new q val plus future reward, subtracted by the mean of new_q.
+                    LN_qs = ((select_f_qs) - mean_f_qs)/(np.sqrt(var_f_qs))
 
-            current_qs = current_qs_list[index]
-            current_qs[action] = new_q
-            # And append to our training data
-            #literally the images from the game.
-            X.append(current_state)
-            #the actions we decide to take.               
-            y.append(current_qs)
+                    new_q = reward + DISCOUNT * LN_qs
+
+                else:
+
+                    new_q = reward
+
+                current_qs = current_qs_list[index]
+                current_qs[action] = new_q
+                # And append to our training data
+                #literally the images from the game.
+                X.append(current_state)
+                #the actions we decide to take.               
+                y.append(current_qs)
 
             # Fit on all samples as one batch, log only on terminal state
             self.model.fit(np.array(X)/255, np.array(y), batch_size=REPLAY_MEMORY_SIZE, verbose=0, shuffle=False, callbacks=[self.tensorboard])
